@@ -1,12 +1,12 @@
 # app.py
 """
 Fraud Detection Dashboard (RF + LSTM) with Individual, Colorful SHAP Explanations
-- Loads artifacts lazily (after the app session starts) to avoid SessionInfo errors
-- Assumes artifacts are in the REPO ROOT:
+- Loads artifacts lazily after the Streamlit session is ready (prevents SessionInfo errors)
+- Assumes artifacts live in the repo root:
     random_forest_tuned.pkl
     scaler.pkl
     feature_columns.json
-    best_lstm.h5   (optional; only needed if you pick LSTM)
+    best_lstm.h5   (optional; only if "LSTM" is selected)
 """
 
 import warnings
@@ -24,23 +24,23 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
 
-# --------------------------------------------------------------------------------------
-# Page config (top of file). DO NOT call shap.initjs() here; we embed SHAP JS per-plot.
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Page config (keep very top)
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Fraud Detection Dashboard", layout="wide")
 
-# --------------------------------------------------------------------------------------
-# Paths (artifacts are in repo root)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Paths (artifacts in repo root)
+# -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 RF_MODEL_PATH   = BASE_DIR / "random_forest_tuned.pkl"
 SCALER_PATH     = BASE_DIR / "scaler.pkl"
 FEATURES_PATH   = BASE_DIR / "feature_columns.json"
 LSTM_H5_PATH    = BASE_DIR / "best_lstm.h5"   # optional
 
-# --------------------------------------------------------------------------------------
-# Cached loaders (called only when needed)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Cached loaders (called on demand)
+# -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_pickle(path: Path):
     return joblib.load(path) if path.exists() else None
@@ -52,13 +52,66 @@ def load_json(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-@st.cache_resource(show_spinner=True)
-def load_lstm(path: Path):
-    return tf.keras.models.load_model(str(path)) if path.exists() else None
+def _keras_custom_objects():
+    """
+    A generous custom_objects map to survive common H5 serialization differences
+    (e.g., activations serialized as functions, or different tf/keras versions).
+    """
+    co = {
+        # Common activations and aliases that sometimes appear in configs
+        "swish": tf.keras.activations.swish,
+        "gelu": tf.keras.activations.gelu if hasattr(tf.keras.activations, "gelu") else tf.nn.gelu,
+        "leaky_relu": tf.nn.leaky_relu,
+        "LeakyReLU": tf.keras.layers.LeakyReLU,
+        "relu": tf.keras.activations.relu,
+        "elu": tf.keras.activations.elu,
+        "selu": tf.keras.activations.selu,
+        "tanh": tf.keras.activations.tanh,
+        "sigmoid": tf.keras.activations.sigmoid,
+        "softmax": tf.keras.activations.softmax,
+        # Common layers sometimes serialized differently
+        "LayerNormalization": tf.keras.layers.LayerNormalization,
+        "BatchNormalization": tf.keras.layers.BatchNormalization,
+        "PReLU": tf.keras.layers.PReLU,
+        "ELU": tf.keras.layers.ELU,
+        "ReLU": tf.keras.layers.ReLU,
+        # Dense/Dropout/LSTM are standard but we map anyway for safety
+        "Dense": tf.keras.layers.Dense,
+        "Dropout": tf.keras.layers.Dropout,
+        "LSTM": tf.keras.layers.LSTM,
+        "GRU": tf.keras.layers.GRU,
+        "RNN": tf.keras.layers.RNN,
+        # Sometimes people wrap ops in Lambda; allow pass-through if present
+        "tf": tf,  # makes tf.* resolvable if used in Lambda
+    }
+    return co
 
-# --------------------------------------------------------------------------------------
+@st.cache_resource(show_spinner=True)
+def load_lstm_safe(path: Path):
+    """
+    Robust loader for the LSTM .h5:
+    - compile=False (we only need inference)
+    - try without custom_objects, then with a generous custom_objects dict
+    """
+    if not path.exists():
+        return None, None
+
+    # First attempt: simplest path, compile off
+    try:
+        m = tf.keras.models.load_model(str(path), compile=False)
+        return m, None
+    except Exception as e1:
+        # Second attempt: with custom_objects
+        try:
+            m = tf.keras.models.load_model(str(path), compile=False, custom_objects=_keras_custom_objects())
+            return m, None
+        except Exception as e2:
+            # Return None and the most informative error
+            return None, f"LSTM load failed.\nFirst error: {repr(e1)}\nSecond error (with custom_objects): {repr(e2)}"
+
+# -----------------------------------------------------------------------------
 # Utility helpers
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def st_shap(plot_html, height=320):
     """Embed SHAP HTML safely in Streamlit."""
     components.html(plot_html, height=height)
@@ -124,9 +177,9 @@ def predict_lstm(lstm_model, X_scaled_2d):
     preds = (probs >= 0.5).astype(int)
     return preds, probs
 
-# --------------------------------------------------------------------------------------
-# SHAP explainers (robust to SHAP version shape differences)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# SHAP explainers (robust to SHAP version output shapes)
+# -----------------------------------------------------------------------------
 def _coerce_single_row_single_output(values, base_values, x_row_2d, class_index=1):
     v = np.array(values)
     if v.ndim == 1:
@@ -171,7 +224,6 @@ def _coerce_single_row_single_output(values, base_values, x_row_2d, class_index=
     return vec.astype(float), base
 
 def get_rf_explainer(rf_model):
-    """Cache explainer once per session to avoid recompute."""
     if "rf_explainer" not in st.session_state:
         try:
             st.session_state["rf_explainer"] = shap.TreeExplainer(
@@ -245,16 +297,15 @@ def shap_force_plot_html(explanation):
         html = obj.html()
     except Exception:
         html = str(obj)
-    # Include JS inline so we don't need a global shap.initjs()
     try:
         js = shap.getjs()
     except Exception:
         js = ""
     return f"<head>{js}</head><body>{html}</body>"
 
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # App
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def main():
     st.title("💳 Fraud Detection (RF + LSTM) with Individual SHAP Explanations")
 
@@ -282,13 +333,11 @@ def main():
         st.error(f"Failed to read CSV: {e}")
         st.stop()
 
-    # Load artifacts lazily AFTER session is ready
+    # Load required artifacts AFTER session is ready
     rf_model = load_pickle(RF_MODEL_PATH)
     scaler = load_pickle(SCALER_PATH)
     feature_columns = load_json(FEATURES_PATH)
-    lstm_model = load_lstm(LSTM_H5_PATH)  # optional, only used if picked
 
-    # Validate artifacts
     missing = []
     if rf_model is None:
         missing.append(str(RF_MODEL_PATH))
@@ -327,14 +376,21 @@ def main():
         min_value=0, max_value=max(0, len(df_features)-1), value=0, step=1
     )
 
+    # Only load the LSTM if/when the user selects it
+    lstm_model = None
+    lstm_error = None
+    if model_choice == "LSTM":
+        lstm_model, lstm_error = load_lstm_safe(LSTM_H5_PATH)
+        if lstm_model is None:
+            st.error("Could not load LSTM model from 'best_lstm.h5'. Using Random Forest is still available.")
+            with st.expander("Show LSTM load error details"):
+                st.code(lstm_error or "No details available.")
+
     if st.button("🔮 Predict & Explain Selected Row"):
-        if model_choice == "Random Forest":
+        if model_choice == "Random Forest" or (model_choice == "LSTM" and lstm_model is None):
             preds, probs = predict_rf(rf_model, X_scaled)
             explanation = explain_rf_instance(rf_model, X_scaled[row_index:row_index+1], feature_columns)
         else:
-            if lstm_model is None:
-                st.error("No LSTM model found. Please place 'best_lstm.h5' in the repo root.")
-                st.stop()
             preds, probs = predict_lstm(lstm_model, X_scaled)
             explanation = explain_lstm_instance(
                 lstm_model, X_scaled, row_index, feature_columns,
