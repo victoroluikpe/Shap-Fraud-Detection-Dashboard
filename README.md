@@ -12,10 +12,12 @@ This is a **Streamlit app** for detecting fraudulent activities using machine le
 2. Run the app:
 
 ## Folder Structure
-- `app.py` - Main Streamlit app
-- `models/` - Saved ML models
-- `data/` - Sample datasets (if any)
-- `requirements.txt` - Python dependencies
-- `README.md` - Project description
-
+Shap-Fraud-Detection-Dashboard/
+│
+├── app.py # Main Streamlit app
+├── models/ # Folder containing saved ML models (.pkl, .h5, etc.)
+├── data/ # Optional folder for sample datasets (if any)
+├── requirements.txt # List of Python dependencies
+├── runtime.txt # Specifies Python version for Streamlit Cloud
+└── README.md # Project description and instructions
 
