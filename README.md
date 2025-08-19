@@ -18,3 +18,4 @@ This is a **Streamlit app** for detecting fraudulent activities using machine le
 - `requirements.txt` - Python dependencies
 - `README.md` - Project description
 
+
