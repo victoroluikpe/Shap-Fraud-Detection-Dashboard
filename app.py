@@ -1,8 +1,8 @@
 # app.py
 """
 Fraud Detection Dashboard (RF + LSTM) with Individual, Colorful SHAP Explanations
-- Loads artifacts lazily after the Streamlit session is ready (prevents SessionInfo errors)
-- Assumes artifacts live in the repo root:
+- TensorFlow is lazy-loaded only if/when LSTM is selected (faster Streamlit startup)
+- Artifacts expected in repo root:
     random_forest_tuned.pkl
     scaler.pkl
     feature_columns.json
@@ -19,7 +19,6 @@ import numpy as np
 import pandas as pd
 import joblib
 import shap
-import tensorflow as tf
 import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
@@ -37,6 +36,7 @@ RF_MODEL_PATH   = BASE_DIR / "random_forest_tuned.pkl"
 SCALER_PATH     = BASE_DIR / "scaler.pkl"
 FEATURES_PATH   = BASE_DIR / "feature_columns.json"
 LSTM_H5_PATH    = BASE_DIR / "best_lstm.h5"   # optional
+DEMO_CSV_PATH   = BASE_DIR / "data" / "default.csv"  # optional demo data
 
 # -----------------------------------------------------------------------------
 # Cached loaders (called on demand)
@@ -52,15 +52,13 @@ def load_json(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _keras_custom_objects():
-    """
-    A generous custom_objects map to survive common H5 serialization differences
-    (e.g., activations serialized as functions, or different tf/keras versions).
-    """
+# --- TensorFlow is intentionally NOT imported at module import time ---
+def _keras_custom_objects(tf):
+    """Create a generous custom_objects map after TF is imported."""
     co = {
-        # Common activations and aliases that sometimes appear in configs
+        # Activations
         "swish": tf.keras.activations.swish,
-        "gelu": tf.keras.activations.gelu if hasattr(tf.keras.activations, "gelu") else tf.nn.gelu,
+        "gelu": getattr(tf.keras.activations, "gelu", tf.nn.gelu),
         "leaky_relu": tf.nn.leaky_relu,
         "LeakyReLU": tf.keras.layers.LeakyReLU,
         "relu": tf.keras.activations.relu,
@@ -69,20 +67,19 @@ def _keras_custom_objects():
         "tanh": tf.keras.activations.tanh,
         "sigmoid": tf.keras.activations.sigmoid,
         "softmax": tf.keras.activations.softmax,
-        # Common layers sometimes serialized differently
+        # Layers
         "LayerNormalization": tf.keras.layers.LayerNormalization,
         "BatchNormalization": tf.keras.layers.BatchNormalization,
         "PReLU": tf.keras.layers.PReLU,
         "ELU": tf.keras.layers.ELU,
         "ReLU": tf.keras.layers.ReLU,
-        # Dense/Dropout/LSTM are standard but we map anyway for safety
         "Dense": tf.keras.layers.Dense,
         "Dropout": tf.keras.layers.Dropout,
         "LSTM": tf.keras.layers.LSTM,
         "GRU": tf.keras.layers.GRU,
         "RNN": tf.keras.layers.RNN,
-        # Sometimes people wrap ops in Lambda; allow pass-through if present
-        "tf": tf,  # makes tf.* resolvable if used in Lambda
+        # Allow tf.* inside Lambda layers
+        "tf": tf,
     }
     return co
 
@@ -90,11 +87,17 @@ def _keras_custom_objects():
 def load_lstm_safe(path: Path):
     """
     Robust loader for the LSTM .h5:
-    - compile=False (we only need inference)
+    - Import TensorFlow lazily
+    - compile=False (inference only)
     - try without custom_objects, then with a generous custom_objects dict
     """
     if not path.exists():
         return None, None
+
+    try:
+        import tensorflow as tf  # lazy import
+    except Exception as e_imp:
+        return None, f"TensorFlow import failed: {repr(e_imp)}"
 
     # First attempt: simplest path, compile off
     try:
@@ -103,10 +106,11 @@ def load_lstm_safe(path: Path):
     except Exception as e1:
         # Second attempt: with custom_objects
         try:
-            m = tf.keras.models.load_model(str(path), compile=False, custom_objects=_keras_custom_objects())
+            m = tf.keras.models.load_model(
+                str(path), compile=False, custom_objects=_keras_custom_objects(tf)
+            )
             return m, None
         except Exception as e2:
-            # Return None and the most informative error
             return None, f"LSTM load failed.\nFirst error: {repr(e1)}\nSecond error (with custom_objects): {repr(e2)}"
 
 # -----------------------------------------------------------------------------
@@ -270,6 +274,8 @@ def explain_lstm_instance(lstm_model, X_scaled_all, idx, feature_names, bg_size=
     x0_3d = x0_2d.reshape((1, 1, X_scaled_all.shape[1]))
 
     try:
+        import tensorflow as tf  # ensure TF present when using DeepExplainer
+        _ = tf.__version__
         explainer = shap.DeepExplainer(lstm_model, background_3d)
         sv_list = explainer.shap_values(x0_3d)
         sv_arr = sv_list[0] if isinstance(sv_list, list) else sv_list
@@ -303,6 +309,31 @@ def shap_force_plot_html(explanation):
         js = ""
     return f"<head>{js}</head><body>{html}</body>"
 
+# --- Robust CSV reader --------------------------------------------------------
+def read_csv_robust(uploaded_file):
+    """
+    Tries a few encodings/separators so uploads don't fail silently.
+    """
+    # Try pandas default first
+    try:
+        return pd.read_csv(uploaded_file)
+    except Exception:
+        pass
+
+    # Try utf-8-sig + common delimiters
+    uploaded_file.seek(0)
+    for sep in [",", ";", "\t", "|"]:
+        for enc in ["utf-8", "utf-8-sig", "latin-1"]:
+            try:
+                uploaded_file.seek(0)
+                return pd.read_csv(uploaded_file, sep=sep, encoding=enc)
+            except Exception:
+                continue
+
+    # If all else fails, raise the original error
+    uploaded_file.seek(0)
+    return pd.read_csv(uploaded_file)  # will throw
+
 # -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
@@ -323,15 +354,33 @@ def main():
 
     st.header("1) Upload CSV")
     uploaded = st.file_uploader("Upload a raw CSV", type=["csv"])
-    if uploaded is None:
-        st.info("Tip: Upload your raw transactions CSV.")
-        st.stop()
 
-    try:
-        df_uploaded = pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        st.stop()
+    df_uploaded = None
+    if uploaded is not None:
+        try:
+            df_uploaded = read_csv_robust(uploaded)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
+    else:
+        # Optional: demo data for quick testing on Streamlit Cloud
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            use_demo = st.checkbox("Use demo data if no file is uploaded", value=DEMO_CSV_PATH.exists())
+        if use_demo:
+            if DEMO_CSV_PATH.exists():
+                try:
+                    df_uploaded = pd.read_csv(DEMO_CSV_PATH)
+                    st.info(f"Loaded demo data: {DEMO_CSV_PATH.relative_to(BASE_DIR)}")
+                except Exception as e:
+                    st.error(f"Failed to read demo CSV: {e}")
+                    st.stop()
+            else:
+                st.warning("Demo dataset not found. Please upload your CSV.")
+                st.stop()
+        else:
+            st.info("Tip: Upload your raw transactions CSV.")
+            st.stop()
 
     # Load required artifacts AFTER session is ready
     rf_model = load_pickle(RF_MODEL_PATH)
@@ -403,17 +452,39 @@ def main():
         st.write(f"**Probability of Fraud:** {probs[row_index]:.2%}")
 
         st.subheader("Explanation for this Transaction (SHAP)")
-        st.markdown("**Waterfall Plot (feature contributions → prediction)**")
-        fig = plt.figure(figsize=(9, 6))
-        shap.plots.waterfall(explanation, max_display=12, show=False)
-        st.pyplot(fig, clear_figure=True)
 
+        # --- Waterfall plot with safeguards & fallback ---
+        st.markdown("**Waterfall Plot (feature contributions → prediction)**")
+        try:
+            num_feats = int(np.size(explanation.values))
+            if num_feats == 0:
+                raise ValueError("Empty SHAP values.")
+            max_disp = max(1, min(12, num_feats))
+            fig, ax = plt.subplots(figsize=(9, 6))
+            shap.plots.waterfall(explanation, max_display=max_disp, show=False)
+            st.pyplot(fig, clear_figure=True)
+        except Exception as e_wf:
+            st.warning(f"Waterfall plot failed ({e_wf}). Showing bar chart fallback.")
+            vals = pd.Series(np.array(explanation.values).reshape(-1), index=feature_columns)
+            top = vals.abs().sort_values(ascending=False).head(12)
+            order = top.index.tolist()
+            fig, ax = plt.subplots(figsize=(9, 6))
+            ax.barh(order, vals.loc[order].values)
+            ax.invert_yaxis()
+            ax.set_xlabel("SHAP value (impact on model output)")
+            ax.set_title("Top feature contributions")
+            st.pyplot(fig, clear_figure=True)
+
+        # --- Interactive force plot ---
         st.markdown("**Force Plot (interactive, colorful)**")
-        html = shap_force_plot_html(explanation)
-        st_shap(html, height=320)
+        try:
+            html = shap_force_plot_html(explanation)
+            st_shap(html, height=320)
+        except Exception as e_force:
+            st.warning(f"Force plot failed ({e_force}).")
 
         with st.expander("Top Feature Contributions (abs SHAP)"):
-            vals = pd.Series(explanation.values, index=feature_columns)
+            vals = pd.Series(np.array(explanation.values).reshape(-1), index=feature_columns)
             top = vals.abs().sort_values(ascending=False).head(15)
             contrib = pd.DataFrame({
                 "feature": top.index,
