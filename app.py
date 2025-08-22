@@ -14,9 +14,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import json
-import inspect
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import joblib
@@ -26,18 +24,15 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
 
-
 # -----------------------------------------------------------------------------
-# Page config (keep very top)
+# Page config
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Fraud Detection Dashboard", layout="wide")
 
-
 # -----------------------------------------------------------------------------
-# Paths (artifacts in repo root)
+# Paths
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
-LSTM_H5_PATH    = BASE_DIR / "best_lstm.h5"  
 RF_MODEL_PATH   = BASE_DIR / "random_forest_tuned.pkl"
 SCALER_PATH     = BASE_DIR / "scaler.pkl"
 FEATURES_PATH   = BASE_DIR / "feature_columns.json"
@@ -46,11 +41,7 @@ FEATURES_PATH   = BASE_DIR / "feature_columns.json"
 @st.cache_resource
 def load_pickle(path: Path):
     if path.exists():
-        try:
-            return joblib.load(path)
-        except Exception:
-            with open(path, "rb") as f:
-                return joblib.load(f)
+        return joblib.load(path)
     return None
 
 @st.cache_resource
@@ -59,20 +50,54 @@ def load_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     return None
 
+# --- Improved LSTM loader ---
 @st.cache_resource
-def load_lstm(path: Path):
-    if path.exists():
+def load_lstm_model_candidates(base_dir: Path):
+    """
+    Try common locations and formats for the LSTM model.
+    Returns (model_or_None, error_message_or_None).
+    """
+    candidates = [
+        base_dir / "best_lstm.h5",
+        base_dir / "models" / "best_lstm.h5",
+        base_dir / "best_lstm",           # SavedModel dir
+        base_dir / "models" / "best_lstm" # SavedModel dir
+    ]
+    tried = []
+    errors = []
+    for p in candidates:
+        tried.append(str(p))
+        if not p.exists():
+            continue
         try:
-            return tf.keras.models.load_model(str(path))
-        except Exception:
-            return None
-    return None
+            m = tf.keras.models.load_model(str(p), compile=False)
+            return m, None
+        except Exception as e:
+            errors.append(f"{p}: {type(e).__name__}: {e}")
+
+    err_msg = (
+        "No model loaded. Tried these paths:\n" + "\n".join(tried) +
+        ("\n\nErrors:\n" + "\n".join(errors[:5]) if errors else " (no candidate files present)")
+    )
+    return None, err_msg
 
 # ========= Load artifacts =========
 rf_model        = load_pickle(RF_MODEL_PATH)
 scaler          = load_pickle(SCALER_PATH)
 feature_columns = load_json(FEATURES_PATH)
-lstm_model      = load_lstm(LSTM_H5_PATH)
+lstm_model, lstm_load_error = load_lstm_model_candidates(BASE_DIR)
+
+# --- Sidebar model uploader for LSTM ---
+uploaded_lstm = st.sidebar.file_uploader("Upload LSTM model (.h5)", type=["h5"])
+if uploaded_lstm is not None:
+    tmp_path = Path("/tmp") / "uploaded_best_lstm.h5"
+    tmp_path.write_bytes(uploaded_lstm.read())
+    try:
+        lstm_model = tf.keras.models.load_model(str(tmp_path), compile=False)
+        st.sidebar.success("✅ Uploaded LSTM loaded successfully.")
+        lstm_load_error = None
+    except Exception as e:
+        st.sidebar.error(f"Uploaded LSTM failed: {type(e).__name__}: {e}")
 
 # ========= Sanity checks =========
 missing = []
@@ -114,8 +139,7 @@ def safe_str(x):
         return "Other"
 
 def extract_categorical_bases_from_features(features):
-    bases = [c.split("_")[0] for c in features if "_" in c]
-    return sorted(list(set(bases)))
+    return sorted(list({c.split("_")[0] for c in features if "_" in c}))
 
 def preprocess_uploaded(df_raw: pd.DataFrame, features: list[str], cardinality_threshold: int = 100):
     log = {"dropped_high_cardinality": [], "encoded": [], "added_missing": [], "dropped_extra": []}
@@ -124,10 +148,9 @@ def preprocess_uploaded(df_raw: pd.DataFrame, features: list[str], cardinality_t
 
     for c in list(df.columns):
         if df[c].dtype == "object" and c not in categorical_bases:
-            nunique = df[c].nunique(dropna=True)
-            if nunique > cardinality_threshold:
+            if df[c].nunique(dropna=True) > cardinality_threshold:
                 df.drop(columns=[c], inplace=True)
-                log["dropped_high_cardinality"].append((c, nunique))
+                log["dropped_high_cardinality"].append(c)
 
     for cat in categorical_bases:
         if cat in df.columns:
@@ -144,7 +167,7 @@ def preprocess_uploaded(df_raw: pd.DataFrame, features: list[str], cardinality_t
 
     extras = [c for c in df.columns if c not in features]
     if extras:
-        df = df.drop(columns=extras)
+        df.drop(columns=extras, inplace=True)
         log["dropped_extra"].extend(extras)
 
     df = df[features]
@@ -163,111 +186,23 @@ def predict_lstm(X_scaled_2d: np.ndarray):
     preds = (probs >= 0.5).astype(int)
     return preds, probs
 
-# ---- RF: cached explainer (faster and consistent shapes)
 @st.cache_resource
 def get_rf_explainer():
     try:
-        # Force probability space (not raw margin) & interventional perturbation
         return shap.TreeExplainer(rf_model, model_output="probability", feature_perturbation="interventional")
     except Exception:
-        # Fallback to default settings
         return shap.TreeExplainer(rf_model)
 
-def _coerce_single_row_single_output(values, base_values, x_row_2d, class_index=1):
-    """
-    Make sure we return a 1-D (n_features,) vector for the selected class,
-    regardless of how SHAP shaped the output.
-    """
-    v = np.array(values)
-
-    # Cases to handle:
-    # (n_features,)                         -> OK
-    # (1, n_features)                       -> squeeze to (n_features,)
-    # (n_features, n_outputs)               -> take column class_index
-    # (1, n_features, n_outputs)            -> take first row and class_index
-    # (n_outputs, n_features)               -> take row class_index
-    # (1, n_outputs, n_features)            -> take class_index, first row
-    if v.ndim == 1:
-        vec = v
-    elif v.ndim == 2:
-        if v.shape[0] == 1 and v.shape[1] > 1 and v.shape[1] == x_row_2d.shape[1]:
-            vec = v[0]
-        elif v.shape[1] == 1 and v.shape[0] == x_row_2d.shape[1]:
-            vec = v[:, 0]
-        elif v.shape[1] == x_row_2d.shape[1]:  # (n_outputs, n_features)
-            idx = class_index if v.shape[0] > 1 else 0
-            vec = v[idx, :]
-        elif v.shape[0] == x_row_2d.shape[1]:  # (n_features, n_outputs)
-            idx = class_index if v.shape[1] > 1 else 0
-            vec = v[:, idx]
-        else:
-            # default squeeze first row
-            vec = np.squeeze(v)
-            if vec.ndim != 1:
-                vec = vec.ravel()
-    elif v.ndim == 3:
-        # Try shapes like (1, n_features, n_outputs) or (1, n_outputs, n_features)
-        if v.shape[0] == 1 and v.shape[1] == x_row_2d.shape[1]:
-            idx = class_index if v.shape[2] > 1 else 0
-            vec = v[0, :, idx]
-        elif v.shape[0] == 1 and v.shape[2] == x_row_2d.shape[1]:
-            idx = class_index if v.shape[1] > 1 else 0
-            vec = v[0, idx, :]
-        else:
-            vec = v.reshape(-1)[:x_row_2d.shape[1]]
-    else:
-        vec = v.reshape(-1)[:x_row_2d.shape[1]]
-
-    # base value: pick single scalar (class_index if vector)
-    bv = np.array(base_values)
-    if bv.ndim == 0:
-        base = float(bv)
-    elif bv.ndim == 1:
-        base = float(bv[class_index] if bv.size > 1 else bv[0])
-    elif bv.ndim == 2:
-        # (n_samples, n_outputs)
-        base = float(bv[0, class_index] if bv.shape[1] > 1 else bv[0, 0])
-    else:
-        base = float(bv.reshape(-1)[0])
-
-    return vec.astype(float), base
-
 def explain_rf_instance(x_row_2d: np.ndarray, feature_names: list[str]):
-    """
-    Return a robust SHAP Explanation for a single row (RF),
-    handling SHAP version differences and multi-output shapes.
-    """
     explainer = get_rf_explainer()
     out = explainer.shap_values(x_row_2d)
-
-    # Case A: newer API sometimes returns shap.Explanation directly
     if isinstance(out, shap.Explanation):
-        values = out.values
-        base_values = out.base_values
-        data = out.data if out.data is not None else x_row_2d
-        vec, base = _coerce_single_row_single_output(values, base_values, x_row_2d, class_index=1)
-        datum = (data[0] if isinstance(data, np.ndarray) and data.shape[0] == 1 else x_row_2d[0])
-        return shap.Explanation(values=vec, base_values=base, data=datum, feature_names=feature_names)
-
-    # Case B: classic API -> list per class OR numpy array
+        return out
     if isinstance(out, list):
-        # pick class 1 if available (fraud)
-        class_idx = 1 if len(out) > 1 else 0
-        vals = out[class_idx]         # (n_samples, n_features) or odd shape
-        ev = explainer.expected_value
-        # expected_value can be list/ndarray/scalar
-        if isinstance(ev, list):
-            base_values = ev[class_idx]
-        else:
-            base_values = ev
-        vec, base = _coerce_single_row_single_output(vals, base_values, x_row_2d, class_index=0)
-        return shap.Explanation(values=vec, base_values=base, data=x_row_2d[0], feature_names=feature_names)
-    else:
-        # numpy array
-        vals = np.array(out)
-        ev = explainer.expected_value
-        vec, base = _coerce_single_row_single_output(vals, ev, x_row_2d, class_index=1)
-        return shap.Explanation(values=vec, base_values=base, data=x_row_2d[0], feature_names=feature_names)
+        return shap.Explanation(values=out[1][0], base_values=explainer.expected_value[1],
+                                data=x_row_2d[0], feature_names=feature_names)
+    return shap.Explanation(values=out[0], base_values=explainer.expected_value,
+                            data=x_row_2d[0], feature_names=feature_names)
 
 def explain_lstm_instance(X_scaled_all: np.ndarray, idx: int, feature_names: list[str],
                           bg_size: int = 64, nsamples: int = 150):
@@ -286,14 +221,8 @@ def explain_lstm_instance(X_scaled_all: np.ndarray, idx: int, feature_names: lis
         sv_list = explainer.shap_values(x0_3d)
         sv_arr = sv_list[0] if isinstance(sv_list, list) else sv_list
         sv_vec = np.array(sv_arr).reshape(-1)[-X_scaled_all.shape[1]:]
-        ev = explainer.expected_value
-        base_value = float(np.array(ev).reshape(-1)[0])
-        return shap.Explanation(
-            values=sv_vec,
-            base_values=base_value,
-            data=x0_2d[0],
-            feature_names=feature_names
-        )
+        base_value = float(np.array(explainer.expected_value).reshape(-1)[0])
+        return shap.Explanation(values=sv_vec, base_values=base_value, data=x0_2d[0], feature_names=feature_names)
     except Exception:
         def f(x2d):
             xseq = x2d.reshape((x2d.shape[0], 1, x2d.shape[1]))
@@ -305,20 +234,11 @@ def explain_lstm_instance(X_scaled_all: np.ndarray, idx: int, feature_names: lis
         sv = explainer.shap_values(x0_2d, nsamples=min(nsamples, 2 * background_2d.shape[1] + 1))
         values = sv[0] if isinstance(sv, list) else sv
         base_value = float(np.mean(f(background_2d)))
-        return shap.Explanation(
-            values=values[0],
-            base_values=base_value,
-            data=x0_2d[0],
-            feature_names=feature_names
-        )
+        return shap.Explanation(values=values[0], base_values=base_value, data=x0_2d[0], feature_names=feature_names)
 
 def shap_force_plot_html(explanation: shap.Explanation):
     obj = shap.plots.force(explanation, matplotlib=False)
-    try:
-        html = obj.html()
-    except Exception:
-        html = str(obj)
-    return f"<head>{shap.getjs()}</head><body>{html}</body>"
+    return f"<head>{shap.getjs()}</head><body>{obj.html() if hasattr(obj,'html') else str(obj)}</body>"
 
 # ========= UI =========
 st.title(" Fraud Detection Dashboard")
@@ -355,7 +275,10 @@ if st.button("🔮 Predict & Explain Selected Row"):
         explanation = explain_rf_instance(X_scaled[row_index:row_index+1], feature_columns)
     else:
         if lstm_model is None:
-            st.error("No LSTM model found. Please place 'best_lstm.h5' in models/.")
+            st.error("❌ LSTM not loaded. See sidebar debug info.")
+            if lstm_load_error:
+                with st.expander("LSTM load debug info"):
+                    st.code(lstm_load_error)
             st.stop()
         preds, probs = predict_lstm(X_scaled)
         explanation = explain_lstm_instance(X_scaled, row_index, feature_columns,
@@ -368,12 +291,12 @@ if st.button("🔮 Predict & Explain Selected Row"):
 
     st.subheader("Explanation for this Transaction (SHAP)")
 
-    st.markdown("**Waterfall Plot (feature contributions → prediction)**")
+    st.markdown("**Waterfall Plot**")
     fig = plt.figure(figsize=(9, 6))
-    shap.plots.waterfall(explanation, max_display=12, show=False)  # explanation is guaranteed 1-D now
+    shap.plots.waterfall(explanation, max_display=12, show=False)
     st.pyplot(fig, clear_figure=True)
 
-    st.markdown("**Force Plot (interactive, colorful)**")
+    st.markdown("**Force Plot (interactive)**")
     html = shap_force_plot_html(explanation)
     st_shap(html, height=320)
 
