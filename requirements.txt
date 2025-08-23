@@ -1,17 +1,11 @@
-# Streamlit and Dashboard
-streamlit==1.28.0
-
-# Core packages
-numpy==1.25.2
-pandas==2.1.1
-matplotlib==3.8.0
+streamlit==1.36.0
+pandas==2.1.4
+numpy==1.26.4
 scikit-learn==1.3.2
+matplotlib==3.8.2
+shap==0.43.0
 joblib==1.3.2
-
-# TensorFlow (match training env)
-tensorflow==2.19.0
 h5py==3.11.0
-
-# SHAP for explanations
-shap==0.42.1
-ipython>=8.14.0
+protobuf==4.25.3
+tensorflow==2.15.0
+keras==2.15.0
