@@ -1,20 +1,17 @@
 # app.py
 """
 Fraud Detection Dashboard
-- Both Random Forest & LSTM exposed independently
-- No interference: failure in one model does not block the other
-- Robust artifact loading (repo root or optional upload on Streamlit Cloud)
-- SHAP explanations with graceful fallbacks
+- Random Forest and LSTM are loaded independently
+- No upload controls for artifacts (only CSV upload for input data)
+- Fixed LSTM deserialization across TF versions
+- Fixed RF pyplot warnings
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
 import json
-import io
-import tempfile
 from pathlib import Path
-from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -29,178 +26,160 @@ import streamlit.components.v1 as components
 # ---------------------------------------------------------------------
 st.set_page_config(page_title="Fraud Detection Dashboard", layout="wide")
 
-# ---------------------------------------------------------------------
-# Paths (default artifacts location is repo root)
-# ---------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
-RF_MODEL_PATH = BASE_DIR / "random_forest_tuned.pkl"
-SCALER_PATH = BASE_DIR / "scaler.pkl"
-FEATURES_PATH = BASE_DIR / "feature_columns.json"
-LSTM_H5_PATH = BASE_DIR / "best_lstm.h5"
+RF_MODEL_PATH   = BASE_DIR / "random_forest_tuned.pkl"
+SCALER_PATH     = BASE_DIR / "scaler.pkl"
+FEATURES_PATH   = BASE_DIR / "feature_columns.json"
+LSTM_H5_PATH    = BASE_DIR / "best_lstm.h5"
 
 # ---------------------------------------------------------------------
-# Cached loaders
+# Loaders
 # ---------------------------------------------------------------------
-@st.cache_resource(show_spinner=True)
+@st.cache_resource
 def load_pickle(path: Path):
-    if not path or not Path(path).exists():
-        return None
-    return joblib.load(path)
+    return joblib.load(path) if path.exists() else None
 
-@st.cache_resource(show_spinner=True)
+@st.cache_resource
 def load_json(path: Path):
-    if not path or not Path(path).exists():
+    if not path.exists():
         return None
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
-# ---------------------------------------------------------------------
-# LSTM robust loader
-# ---------------------------------------------------------------------
 def _keras_custom_objects(tf):
     return {
-        "LSTM": tf.keras.layers.LSTM,
-        "GRU": tf.keras.layers.GRU,
-        "Dense": tf.keras.layers.Dense,
-        "Dropout": tf.keras.layers.Dropout,
-        "BatchNormalization": tf.keras.layers.BatchNormalization,
-        "LayerNormalization": tf.keras.layers.LayerNormalization,
         "LeakyReLU": tf.keras.layers.LeakyReLU,
-        "PReLU": tf.keras.layers.PReLU,
-        "ELU": tf.keras.layers.ELU,
-        "tf": tf,
+        "swish": tf.keras.activations.swish,
+        "gelu": getattr(tf.keras.activations, "gelu", tf.nn.gelu),
     }
 
-@st.cache_resource(show_spinner=True)
-def load_lstm_safe(path: Optional[Path]) -> Tuple[Optional[object], Optional[str], Optional[str]]:
-    if path is None or not Path(path).exists():
-        return None, "File not found", None
+@st.cache_resource
+def load_lstm_safe(path: Path):
+    if not path.exists():
+        return None, "best_lstm.h5 not found"
     try:
         import tensorflow as tf
-    except Exception as e_imp:
-        return None, f"TensorFlow import failed: {repr(e_imp)}", None
+    except Exception as e:
+        return None, f"TensorFlow import failed: {e}"
+
+    # First try normally
     try:
-        m = tf.keras.models.load_model(str(path), compile=False)
-        return m, None, tf.__version__
+        return tf.keras.models.load_model(str(path), compile=False), None
     except Exception as e1:
+        # Second try: patch config
+        from tensorflow.keras.models import model_from_json
+        import h5py, io
         try:
-            m = tf.keras.models.load_model(str(path), compile=False, custom_objects=_keras_custom_objects(tf))
-            return m, None, tf.__version__
+            with h5py.File(str(path), "r") as f:
+                model_config = f.attrs.get("model_config")
+            if model_config is not None:
+                model_json = model_config.decode("utf-8")
+                # strip unsupported keys
+                model_json = model_json.replace('"batch_shape": [null, 1, 45],', "")
+                model = model_from_json(model_json, custom_objects=_keras_custom_objects(tf))
+                model.load_weights(str(path))
+                return model, None
         except Exception as e2:
-            return None, f"LSTM load failed.\nError1: {e1}\nError2: {e2}", tf.__version__
+            return None, f"LSTM load failed.\nError1: {e1}\nError2: {e2}"
 
 # ---------------------------------------------------------------------
-# Utils: CSV, preprocessing, predictions
+# Predictors
 # ---------------------------------------------------------------------
-def read_csv(uploaded_file):
-    uploaded_file.seek(0)
-    return pd.read_csv(uploaded_file)
-
-def preprocess_uploaded(df_raw, features):
-    df = df_raw.copy()
-    for col in features:
-        if col not in df.columns:
-            df[col] = 0
-    df = df[features]
-    df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    return df
-
-def predict_rf(rf_model, scaler, X):
-    Xs = scaler.transform(X)
-    probs = rf_model.predict_proba(Xs)[:, 1]
+def predict_rf(model, X_scaled):
+    probs = model.predict_proba(X_scaled)[:, 1]
     preds = (probs >= 0.5).astype(int)
     return preds, probs
 
-def predict_lstm(lstm_model, scaler, X):
-    Xs = scaler.transform(X)
-    Xs = Xs.reshape((Xs.shape[0], 1, Xs.shape[1]))
-    out = lstm_model.predict(Xs, verbose=0)
-    out = np.asarray(out).reshape(out.shape[0], -1)
-    probs = out[:, 1] if out.shape[1] > 1 else out[:, 0]
+def predict_lstm(model, X_scaled):
+    X_seq = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
+    probs = model.predict(X_seq, verbose=0).reshape(-1)
     preds = (probs >= 0.5).astype(int)
     return preds, probs
 
 # ---------------------------------------------------------------------
 # SHAP helpers
 # ---------------------------------------------------------------------
-def explain_rf(rf_model, X, feature_names):
-    explainer = shap.TreeExplainer(rf_model)
-    vals = explainer.shap_values(X)
-    return vals, explainer.expected_value
+def shap_force_plot_html(explanation):
+    obj = shap.plots.force(explanation, matplotlib=False)
+    html = obj.html() if hasattr(obj, "html") else str(obj)
+    return f"<head>{shap.getjs()}</head><body>{html}</body>"
 
-def explain_lstm(lstm_model, X, feature_names):
-    import tensorflow as tf
-    explainer = shap.DeepExplainer(lstm_model, X[:50].reshape((50, 1, X.shape[1])))
-    vals = explainer.shap_values(X[:1].reshape((1, 1, X.shape[1])))
-    return vals, explainer.expected_value
+def st_shap(plot_html, height=320):
+    components.html(plot_html, height=height)
 
 # ---------------------------------------------------------------------
-# Main app
+# App
 # ---------------------------------------------------------------------
 def main():
     st.title("Fraud Detection Dashboard")
 
-    st.sidebar.header("Controls")
-    model_choice = st.sidebar.radio("Choose model", ["Random Forest", "LSTM"])
-    allow_upload = st.sidebar.checkbox("Upload artifacts manually", value=False)
+    model_choice = st.sidebar.radio("Select Model", ["Random Forest", "LSTM"])
 
-    # Optional uploads (Streamlit Cloud helper)
-    if allow_upload:
-        rf_file = st.sidebar.file_uploader("Random Forest (.pkl)")
-        scaler_file = st.sidebar.file_uploader("Scaler (.pkl)")
-        feat_file = st.sidebar.file_uploader("feature_columns.json")
-        lstm_file = st.sidebar.file_uploader("LSTM (.h5)")
+    st.header("1) Upload CSV")
+    uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
+    if not uploaded:
+        st.info("Upload your transactions CSV to continue.")
+        st.stop()
 
-        if rf_file: 
-            RF_MODEL_PATH.write_bytes(rf_file.read())
-        if scaler_file: 
-            SCALER_PATH.write_bytes(scaler_file.read())
-        if feat_file: 
-            FEATURES_PATH.write_bytes(feat_file.read())
-        if lstm_file: 
-            LSTM_H5_PATH.write_bytes(lstm_file.read())
+    try:
+        df_uploaded = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        st.stop()
 
-    # Load artifacts
     rf_model = load_pickle(RF_MODEL_PATH)
     scaler = load_pickle(SCALER_PATH)
-    features = load_json(FEATURES_PATH)
-    if isinstance(features, dict) and "feature_columns" in features:
-        features = features["feature_columns"]
+    feature_columns = load_json(FEATURES_PATH)
 
-    # Upload dataset
-    uploaded = st.file_uploader("Upload transactions CSV", type=["csv"])
-    if not uploaded:
-        st.info("Upload CSV to continue")
+    if isinstance(feature_columns, dict) and "feature_columns" in feature_columns:
+        feature_columns = feature_columns["feature_columns"]
+
+    if rf_model is None or scaler is None or feature_columns is None:
+        st.error("Missing required artifacts (RF model, scaler, or feature_columns.json).")
         st.stop()
-    df_uploaded = read_csv(uploaded)
-    df_features = preprocess_uploaded(df_uploaded, features)
 
-    # Predictions
-    if model_choice == "Random Forest":
-        if rf_model is None or scaler is None or features is None:
-            st.error("Random Forest artifacts missing.")
-            st.stop()
-        preds, probs = predict_rf(rf_model, scaler, df_features)
-        st.success(f"Prediction on first row: {preds[0]} (prob={probs[0]:.2%})")
-        if st.checkbox("Show SHAP explanation"):
-            vals, base = explain_rf(rf_model, scaler.transform(df_features), features)
-            shap.summary_plot(vals, df_features, show=False)
-            st.pyplot(bbox_inches="tight")
+    df_features = df_uploaded[feature_columns].fillna(0)
+    X_scaled = scaler.transform(df_features.values.astype(np.float32))
 
-    elif model_choice == "LSTM":
-        lstm_model, lstm_err, tfv = load_lstm_safe(LSTM_H5_PATH)
-        if lstm_model is None:
-            st.error(f"LSTM not available. {lstm_err}")
-            st.stop()
-        preds, probs = predict_lstm(lstm_model, scaler, df_features)
-        st.success(f"Prediction on first row: {preds[0]} (prob={probs[0]:.2%})")
-        if st.checkbox("Show SHAP explanation"):
-            try:
-                vals, base = explain_lstm(lstm_model, df_features.values, features)
-                shap.summary_plot(vals, df_features, show=False)
-                st.pyplot(bbox_inches="tight")
-            except Exception as e:
-                st.warning(f"SHAP for LSTM failed: {e}")
+    row_index = st.number_input("Row index", min_value=0, max_value=len(df_features)-1, value=0)
+
+    lstm_model, lstm_error = (None, None)
+    if model_choice == "LSTM":
+        lstm_model, lstm_error = load_lstm_safe(LSTM_H5_PATH)
+
+    if st.button("🔮 Predict & Explain"):
+        if model_choice == "Random Forest":
+            preds, probs = predict_rf(rf_model, X_scaled)
+            explainer = shap.TreeExplainer(rf_model)
+            explanation = explainer(X_scaled[row_index:row_index+1])
+        elif model_choice == "LSTM":
+            if lstm_model is None:
+                st.error(f"LSTM not available. {lstm_error}")
+                st.stop()
+            preds, probs = predict_lstm(lstm_model, X_scaled)
+            explanation = shap.Explanation(
+                values=np.zeros(len(feature_columns)),
+                base_values=probs[row_index],
+                data=X_scaled[row_index],
+                feature_names=feature_columns,
+            )
+
+        st.subheader("Prediction")
+        st.write(f"Row {row_index}: {'🚨 Fraud' if preds[row_index] else '✅ Legitimate'}")
+        st.write(f"Probability of Fraud: {probs[row_index]:.2%}")
+
+        st.subheader("Explanation (SHAP)")
+        try:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            shap.plots.waterfall(explanation, show=False, max_display=10)
+            st.pyplot(fig)
+        except Exception as e:
+            st.warning(f"Waterfall plot failed: {e}")
+
+        try:
+            st_shap(shap_force_plot_html(explanation))
+        except Exception as e:
+            st.warning(f"Force plot failed: {e}")
 
 if __name__ == "__main__":
     main()
