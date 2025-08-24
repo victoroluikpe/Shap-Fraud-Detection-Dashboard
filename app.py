@@ -2,12 +2,15 @@
 """
 Fraud Detection Dashboard
 
-- Artifacts expected in repo root:
+- Artifacts expected in BASE DIR (same folder as app.py):
     random_forest_tuned.pkl
     scaler.pkl
     feature_columns.json
-    best_lstm/  (SavedModel dir, preferred)
-    best_lstm.h5  (fallback, optional)
+    best_lstm.h5
+    best_lstm_quantized.tflite
+    random_forest_tuned.onnx
+    random_forest_tuned_int8.onnx
+    model.ipynb (not loaded, just stored)
 - Random Forest loaded at start (fast)
 - LSTM lazy-loaded only when selected
 - Missing trained feature columns in uploaded CSV are added as zeros (prevents KeyError)
@@ -35,12 +38,17 @@ import streamlit.components.v1 as components
 # Config / paths
 # --------------------------
 st.set_page_config(page_title="Fraud Detection Dashboard", layout="wide")
-BASE_DIR = Path(__file__).parent
+
+BASE_DIR = Path(__file__).parent  # project base folder
+
+# Model artifact paths
 RF_MODEL_PATH = BASE_DIR / "random_forest_tuned.pkl"
 SCALER_PATH = BASE_DIR / "scaler.pkl"
 FEATURES_PATH = BASE_DIR / "feature_columns.json"
-LSTM_DIR_PATH = BASE_DIR / "best_lstm"   # preferred (SavedModel)
-LSTM_H5_PATH = BASE_DIR / "best_lstm.h5" # fallback
+LSTM_H5_PATH = BASE_DIR / "best_lstm.h5" 
+LSTM_TFLITE_PATH = BASE_DIR / "best_lstm_quantized.tflite"  # not used in app yet
+RF_ONNX_PATH = BASE_DIR / "random_forest_tuned.onnx"        # not used in app yet
+RF_ONNX_INT8_PATH = BASE_DIR / "random_forest_tuned_int8.onnx"  # not used in app yet
 
 # --------------------------
 # Cached loaders
@@ -60,34 +68,24 @@ def load_json(path: Path):
 # LSTM loader (robust)
 # --------------------------
 @st.cache_resource
-def load_lstm_safe(dir_path: Path, h5_path: Path) -> Tuple[Optional[object], Optional[str]]:
+def load_lstm_safe(h5_path: Path) -> Tuple[Optional[object], Optional[str]]:
     """
     Try to load LSTM:
-    - first try SavedModel dir
-    - if fails, try .h5
+    - try .h5 (since SavedModel dir not used here)
     """
     try:
         import tensorflow as tf
     except Exception as e:
         return None, f"TensorFlow import failed: {repr(e)}"
 
-    if dir_path.exists():
-        try:
-            m = tf.keras.models.load_model(str(dir_path))
-            return m, None
-        except Exception as e1:
-            err_msg = f"SavedModel load failed: {repr(e1)}"
-    else:
-        err_msg = "SavedModel directory not found."
-
     if h5_path.exists():
         try:
             m = tf.keras.models.load_model(str(h5_path), compile=False)
             return m, None
-        except Exception as e2:
-            return None, err_msg + f"\nAlso .h5 load failed: {repr(e2)}"
+        except Exception as e:
+            return None, f".h5 load failed: {repr(e)}"
     else:
-        return None, err_msg + "\nNo .h5 file found."
+        return None, ".h5 file not found."
 
 # --------------------------
 # Utilities: CSV + features
@@ -142,9 +140,17 @@ def explain_rf_instance(rf_model, x_row_2d, feature_names):
         return out
     if isinstance(out, list):
         idx = 1 if len(out) > 1 else 0
-        return shap.Explanation(values=out[idx][0], base_values=explainer.expected_value[idx],
-                                data=x_row_2d[0], feature_names=feature_names)
-    return shap.Explanation(values=np.array(out).reshape(-1),
+        values = out[idx][0]
+    else:
+        values = np.array(out).reshape(-1)
+
+    # 🔧 Ensure length matches features
+    if len(values) > len(feature_names):
+        values = values[:len(feature_names)]
+    elif len(values) < len(feature_names):
+        values = np.pad(values, (0, len(feature_names) - len(values)))
+
+    return shap.Explanation(values=values,
                             base_values=np.mean(rf_model.predict_proba(x_row_2d)[:,1]),
                             data=x_row_2d[0], feature_names=feature_names)
 
@@ -162,8 +168,6 @@ def explain_lstm_instance(lstm_model, X_scaled_all, idx, feature_names, bg_size=
         explainer = shap.DeepExplainer(lstm_model, background_3d)
         sv = explainer.shap_values(x0_3d)
         values = sv[0][0] if isinstance(sv, list) else sv[0]
-        return shap.Explanation(values=values, base_values=np.mean(explainer.expected_value),
-                                data=x0_2d[0], feature_names=feature_names)
     except Exception:
         def f(x2d):
             xseq = x2d.reshape((x2d.shape[0], 1, x2d.shape[1]))
@@ -173,8 +177,16 @@ def explain_lstm_instance(lstm_model, X_scaled_all, idx, feature_names, bg_size=
         explainer = shap.KernelExplainer(f, background_2d)
         sv = explainer.shap_values(x0_2d, nsamples=min(nsamples, 2 * background_2d.shape[1] + 1))
         values = sv[0] if isinstance(sv, list) else sv
-        return shap.Explanation(values=values[0], base_values=np.mean(f(background_2d)),
-                                data=x0_2d[0], feature_names=feature_names)
+
+    values = np.array(values).reshape(-1)
+    if len(values) > len(feature_names):
+        values = values[:len(feature_names)]
+    elif len(values) < len(feature_names):
+        values = np.pad(values, (0, len(feature_names) - len(values)))
+
+    return shap.Explanation(values=values,
+                            base_values=np.mean(lstm_model.predict(x0_3d, verbose=0)),
+                            data=x0_2d[0], feature_names=feature_names)
 
 def shap_force_plot_html(explanation):
     try:
@@ -213,7 +225,8 @@ def main():
     feature_columns = load_json(FEATURES_PATH)
 
     if rf_model is None or scaler is None or feature_columns is None:
-        st.error("Missing required artifacts.")
+        st.error("❌ Missing required artifacts in base directory.")
+        st.write("Expected files:", RF_MODEL_PATH, SCALER_PATH, FEATURES_PATH)
         st.stop()
     if isinstance(feature_columns, dict) and "feature_columns" in feature_columns:
         feature_columns = feature_columns["feature_columns"]
@@ -226,9 +239,9 @@ def main():
 
     lstm_model, lstm_error = (None, None)
     if model_choice == "LSTM":
-        lstm_model, lstm_error = load_lstm_safe(LSTM_DIR_PATH, LSTM_H5_PATH)
+        lstm_model, lstm_error = load_lstm_safe(LSTM_H5_PATH)
         if lstm_model is None:
-            st.warning("LSTM could not be loaded. Random Forest is still available.")
+            st.warning("⚠️ LSTM could not be loaded. Random Forest is still available.")
             with st.expander("LSTM load error details"):
                 st.code(lstm_error or "No details available.")
 
